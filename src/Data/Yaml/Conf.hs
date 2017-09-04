@@ -1,138 +1,174 @@
 {-# LANGUAGE CPP, TemplateHaskell, MultiParamTypeClasses, FunctionalDependencies #-}
-module Data.Yaml.Conf where
+{-|
+Module      : Data.Yaml.Conf
+Copyright   : Copyright (c) 2017 Anton Pirogov
+License     : MIT
+Maintainer  : anton.pirogov@gmail.com
+
+This module defines everything needed to extend a record type with the capability
+to be constructed from a sequence of YAML files, i.e. from multiple YAML configuration
+files that supply a subset of the field values.
+
+To do this, you just need to provide a 'Default' instance,
+then call 'makeConfig' and 'deriveConfigJSON' for your record type.
+After that you can use 'loadConf' and 'defaultConfSources' to obtain a configuration.
+
+This meshes well with argument parsing, e.g. you can use a parser built with
+optparse-applicative to override the values supplied in the files with the values
+given as command line parameters.
+For this to work, the parser must behave well, i.e. only the values that were
+supplied by the user should differ from the values given in the 'Default'
+instance.
+
+See <http://github.com/apirogov/yaml-conf> for a working example.
+-}
+module Data.Yaml.Conf
+  (Conf, ConfDiff(..), ConfDiffRel(..), makeConfig, deriveConfigJSON,
+  loadConf, mergeConf, defaultConfPaths, defaultConfSources, addConfSource
+  ) where
 
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative
 #endif
 
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Monoid
 import Control.Monad
 import Data.Default
 
 import System.Environment.XDG.BaseDir (getAllConfigFiles)
 
-import Options.Applicative (execParser,ParserInfo)
-
-import Data.Yaml (FromJSON, decodeFileEither,)
+import Data.Yaml (FromJSON, decodeFileEither)
 
 import Data.Aeson.TH
 import Language.Haskell.TH
 import Language.Haskell.TH.Datatype
 
--- marks data type as config container
+-- | marks data type as config container. each config has a default value.
 class (Default a) => Conf a where
 
--- marks a generated config diff type
-class ConfDiff a where
-
 -- Monoid helpers for instance generation
--- TODO: can this be unified with Generics?
 ----
 -- used for atoms (not-ConfDiff types) -> right Just value wins
 updA :: Maybe a -> Maybe a -> Maybe a
 updA a b = maybe a Just b
 -- used for containers (ConfDiff) -> if both Just, combine diff recursively
-updC :: (ConfDiff a, Monoid a) => Maybe a -> Maybe a -> Maybe a
+updC :: (ConfDiff a) => Maybe a -> Maybe a -> Maybe a
 updC (Just a) (Just b) = Just $ a <> b
 updC a b = getLast $ Last a <> Last b
 
--- convert between conf and and its diff, toDiff creates a MINIMAL diff
--- fromDiff creates a config by setting default values at unset fields
--- each conf is part of exactly one such pair. Eq b is auto-derived,
--- Conf / ConfDiff tags are generated, Monoid b is generated respecting Conf(Diff) tags
-class (Conf a, Default a, Eq b, Monoid b, ConfDiff b) =>
-      ConfDiffRel a b | a->b, b->a where
-  toDiff   :: a -> b
-  fromDiff :: b -> a
-  fromDiff = updateConf def
+-- | marks a generated ConfDiff type, which is a pseudo-torsor on Confs
+-- (pseudo because it is just a monoid, not a group).
+-- Instances are generated using a derived 'Eq' and a 'Conf'-respecting
+-- generated 'Monoid' instance.
+class (Eq b, Monoid b) => ConfDiff b where
+  -- | 'ConfDiff's can be 'diff'ed (kind-of substraction, but behaves not so well).
+  -- This is used to obtain minimal-invasive diffs without redundancy.
+  -- Rule: ∀(a,b): a <> ('diff' a b) = b.
+  diff :: b -> b -> b
+
+-- | Marks a pair of a configuration and its monoidal diff type.
+-- minimal set: 'mkDiff' and ('fromDiff' or 'updateConf')
+class (Conf a, ConfDiff b) => ConfDiffRel a b | a->b, b->a where
+  -- | Injects all fields of a 'Conf' into a 'ConfDiff' that updates all fields.
+  mkDiff   :: a -> b
+  -- | Obtain a 'ConfDiff' that patches the first 'Conf' to the second.
+  diffConfFrom :: a -> a -> b
+  diffConfFrom c c' = (mkDiff c) `diff` (mkDiff c')
+
+  -- | Apply a 'ConfDiff' to a 'Conf'.
   updateConf :: a -> b -> a
   updateConf c d = fromDiff (toDiff c <> d)
 
--- relationship between config and configdiff types
--- described roughly by following commutation diagram:
--- 1 --def---> C
---  \  toDiff | ^
---   def      v | fromDiff
---    \----->  D ⟲ mempty
---             ↻ mappend
+  -- these functions work relative to the default configuration:
+
+  -- | Convert a 'Conf' into a 'ConfDiff' (only the changes relative to 'Default').
+  toDiff   :: a -> b
+  toDiff = diffConfFrom def
+
+  -- | Convert a 'ConfDiff' into a 'Conf', filling in missing values from 'Default'.
+  fromDiff :: b -> a
+  fromDiff = updateConf def
 
 -- ConfDiffRel helpers for instance generation
 ----
--- if equal to default, then nothing. else just value
-nonDef :: (Conf a, Eq b) => (a -> b) -> b -> Maybe b
-nonDef f v = if f def /= v then Just v else Nothing
+-- diff helper for regular fields
+diffField :: (Eq a) => Maybe a -> Maybe a -> Maybe a
+diffField a b = if isNothing b || a==b then Nothing
+                else getLast $ Last a <> Last b
+
+-- diff helper for subconfs
+diffField' :: (Eq a, ConfDiff a) => Maybe a -> Maybe a -> Maybe a
+diffField' a b = case b of
+                   Nothing -> Nothing
+                   Just w -> case a of
+                     Nothing -> Just w
+                     Just v -> let u = diff v w
+                               in if u==mempty then Nothing else Just u
+
+-- fromDiff helpers:
 -- if missing, take default
 maybeDef :: (Conf a) => (a -> b) -> Maybe b -> b
 maybeDef f v = fromMaybe (f def) v
-
--- same for nested config types
-nonDef' :: (ConfDiffRel a b) => a -> Maybe b
-nonDef' c = if (toDiff c) /= (toDiff def) then Just (toDiff c) else Nothing
+-- special case when applied to subconfs
 maybeDef' :: (ConfDiffRel a b) => Maybe b -> a
 maybeDef' = fromDiff . fromMaybe mempty
 
 -- conf management
 ----
--- load conf diff from args, return difference from default values
-getConfFromArgs :: (ConfDiffRel a b) => ParserInfo a -> IO b
-getConfFromArgs pinfo = toDiff <$> execParser pinfo
 
 -- try to load file. if it fails, return empty config. otherwise return conf diff
--- TODO: how to handle Left's?
-getConfFromFile :: (FromJSON b, ConfDiffRel a b) => FilePath -> IO b
-getConfFromFile filename = either (const mempty) id <$> decodeFileEither filename
+-- TODO: how to handle Left's sanely?
+getYamlConf :: (FromJSON b, ConfDiffRel a b) => FilePath -> IO b
+getYamlConf filename = either (const mempty) id <$> decodeFileEither filename
 
 -- a config is read either from args or from file
--- TODO: maybe also parse from Stringy type?
-data ConfSource a b = ArgsConf (ParserInfo a) | FileConf FilePath
 
--- unified method to get config from args or files
-getConf :: (FromJSON b, ConfDiffRel a b) => ConfSource a b -> IO b
-getConf (ArgsConf p) = getConfFromArgs p
-getConf (FileConf f) = getConfFromFile f
+-- | returns default XDG directories for configs and a filename for the current dir
+defaultConfPaths :: String -> String -> IO [FilePath]
+defaultConfPaths appname cnfname = (localconf:) <$> getAllConfigFiles appname cnffile
+  where (cnffile, localconf) = (cnfname++".yaml", appname++'.':cnffile)
 
--- returns default XDG directories for configs and a filename for the current dir
-defaultConfSources :: String -> String -> IO [FilePath]
-defaultConfSources progname confname = (localconf:) <$> getAllConfigFiles progname conffile
-  where (conffile, localconf) = (confname++".yaml", progname++'.':conffile)
-
--- given programname and configname and argparser,
+-- given programname and configname,
 -- return ordered list of sources with increasing priority:
--- system, user, workdir, args
-defaultConfSourcesWith :: String -> String -> Maybe (ParserInfo a) -> IO [ConfSource a b]
-defaultConfSourcesWith pn cn p = do
-  fs <- map FileConf <$> defaultConfSources pn cn
-  let srcs = case p of
-              Nothing -> fs
-              Just pi -> ArgsConf pi : fs
-  return $ reverse srcs
+-- | system-wide, user-specific, working directory
+defaultConfSources :: (FromJSON b, ConfDiffRel a b) => String -> String -> IO [IO b]
+defaultConfSources pn cn = reverse . map getYamlConf <$> defaultConfPaths pn cn
 
--- for debugging. we do not expose diffs to the user
-loadConfDiffs :: (FromJSON b, ConfDiffRel a b) => [ConfSource a b] -> IO [b]
-loadConfDiffs = mapM getConf
+-- | add an additional source (IO action that reads a configuration)
+addConfSource :: (ConfDiffRel a b) => IO a -> [IO b] -> [IO b]
+addConfSource x xs = xs ++ [toDiff <$> x]
 
--- given a list of sources, load the configurations, merge and return accumulated
-loadConf :: (FromJSON b, ConfDiffRel a b) => [ConfSource a b] -> IO a
-loadConf = return . fromDiff . foldl (<>) mempty <=< loadConfDiffs
+-- | merge a list of configuration diffs
+mergeConf :: (ConfDiffRel a b) => [b] -> a
+mergeConf = fromDiff . foldl (<>) mempty
+
+-- | given a list of source actions, get the configuration diffs,
+-- merge and return accumulated, with missing fields filled up from the default values
+loadConf :: (FromJSON b, ConfDiffRel a b) => [IO b] -> IO a
+loadConf = return . mergeConf <=< sequence
 
 -- TH magic
 ----
 
--- sequence of strings x0, x1, ...
+-- | sequence of strings, for x returns x0, x1, ...
 varseq x = map ((x ++).show) [0..]
--- modify names
+-- | prepend to a name
 consName s n = mkName (s ++ nameBase n)
+-- | append to a name
 snocName n s = mkName (nameBase n ++ s)
+
 diffName = flip snocName "Diff"
--- returns whether Type is known to have a Conf instance
+
+-- | returns whether Type is known to have a Conf instance
 isConfInstance :: Type -> Q Bool
 isConfInstance = isInstance ''Conf . (:[])
 
--- generates: instance Foo Bar where
+-- | generates: instance Foo Bar where
 mkDummyInstance :: Name -> Name -> DecsQ
 mkDummyInstance tc t = mkInstance (AppT (ConT tc) (ConT t)) []
 
+-- | version-agnostic wrapper to generate an instance
 mkInstance :: Type -> [Dec] -> DecsQ
 #if MIN_VERSION_template_haskell(2,11,0)
 mkInstance t ds = return [InstanceD Nothing [] t ds]
@@ -140,7 +176,7 @@ mkInstance t ds = return [InstanceD Nothing [] t ds]
 mkInstance t ds = return [InstanceD [] t ds]
 #endif
 
--- is this a single-constructor record type without type variables?
+-- | check that given name is a single-constructor record type without type variables
 isEligible :: Name -> Q Bool
 isEligible tn = do
   info <- reifyDatatype tn
@@ -150,7 +186,7 @@ isEligible tn = do
          (RecordConstructor _) -> return True
          _ -> return False
 
--- given a configuration record type, return unwrapped field types
+-- | given a configuration record type, return unwrapped field types
 getFields :: Name -> Q [(Name,Type)]
 getFields d = do
   info <- reifyDatatype d
@@ -164,7 +200,7 @@ getConstr d = do
   info <- reifyDatatype d
   return $ constructorName $ head $ datatypeCons info
 
--- generate a ConfDiff-type from a Conf data type
+-- | generate a ConfDiff-type from a Conf data type
 mkDiffType :: Name -> DecsQ
 mkDiffType tn = do
   fs <- getFields tn
@@ -195,6 +231,9 @@ mkDiffType tn = do
   return [DataD [] (diffName tn) [] [dcon] [''Eq, ''Show]]
 #endif
 
+-- | generate a monoid instance in such a way that atomic fields are overwritten
+-- completely, but fields that themselves are sub-configurations are handled in a
+-- granular fashion.
 mkMonoidInstance :: Name -> Name -> DecsQ
 mkMonoidInstance n nd = do
   fs <- getFields n
@@ -214,10 +253,11 @@ mkMonoidInstance n nd = do
 
   mkInstance (AppT (ConT ''Monoid) (ConT nd)) [mempty_dec, mappend_dec]
 
--- example:
--- instance ConfDiffRel TestConf TestConfDiff where
---   toDiff (TestConf a b) = TestConfDiff (nonDef _foo a) (nonDef _bar b)
---   fromDiff (TestConfDiff a b) = TestConf (maybeDef _foo a) (maybeDef _bar b)
+-- | generates a matching pattern, like (Foo a b c)
+mkPat :: Name -> [String] -> Pat
+mkPat c vs = ConP c $ map (VarP . mkName) vs
+
+-- | generates an instance for the ConfDiffRel class
 mkRelInstance :: Name -> Name -> DecsQ
 mkRelInstance n nd = do
   cfs <- getFields n
@@ -225,45 +265,70 @@ mkRelInstance n nd = do
   isconf <- mapM (isConfInstance . snd) cfs
   let dcons = diffName ccons
   let vars = take (length cfs) $ varseq "x"
-  let mk f = zipWith (\((n,_),c) v -> if c --  for subconfs: non/maybeDef' var
-                                      then (VarE $ snocName f "'")`AppE`(VarE v)
-                                            -- for leafs: non/maybeDef _field var
-                                      else (VarE f)`AppE`(VarE n)`AppE`(VarE v))
+  let inj = zipWith (\c v -> if c -- for subconfs: convert and wrap
+                             then (ConE 'Just)`AppE`((VarE 'mkDiff)`AppE`(VarE v))
+                                  -- for leafs - wrap
+                             else (ConE 'Just)`AppE`(VarE v)) isconf (mkName <$> vars)
+  let frf = zipWith (\((n,_),c) v -> if c --  for subconfs: non/maybeDef' var
+                                     then (VarE 'maybeDef')`AppE`(VarE v)
+                                          -- for leafs: non/maybeDef _field var
+                                     else (VarE 'maybeDef)`AppE`(VarE n)`AppE`(VarE v))
                  (cfs `zip` isconf) (mkName <$> vars)
-  let to_dec   = FunD 'toDiff   [Clause [ConP ccons $ map (VarP . mkName) vars]
-                                 (NormalB $ foldl (AppE) (ConE dcons) $ mk 'nonDef) []]
-  let from_dec = FunD 'fromDiff [Clause [ConP dcons $ map (VarP . mkName) vars]
-                                 (NormalB $ foldl (AppE) (ConE ccons) $ mk 'maybeDef) []]
-  mkInstance (AppT (AppT (ConT ''ConfDiffRel) (ConT n)) (ConT nd)) [to_dec, from_dec]
+  let mk_dec   = FunD 'mkDiff   [Clause [mkPat ccons vars]
+                                 (NormalB $ foldl (AppE) (ConE dcons) inj) []]
+  let from_dec = FunD 'fromDiff [Clause [mkPat dcons vars]
+                                 (NormalB $ foldl (AppE) (ConE ccons) frf) []]
+  mkInstance (AppT (AppT (ConT ''ConfDiffRel) (ConT n)) (ConT nd))
+    [mk_dec, from_dec]
 
--- example:
+-- | generates an instance for the ConfDiff class, implementing the diff operation
+mkDiffInstance :: Name -> Name -> DecsQ
+mkDiffInstance n nd = do
+  cfs <- getFields n
+  ccons <- getConstr n
+  isconf <- mapM (isConfInstance . snd) cfs
+  let dcons = diffName ccons
+  let vars = take (length cfs) $ varseq "x"
+  let vars2 = take (length cfs) $ varseq "y"
+  let df = zipWith (\c (v1,v2) -> (if c then VarE 'diffField' else VarE 'diffField )
+                                    `AppE`(VarE v1)`AppE`(VarE v2))
+                   isconf ((mkName <$> vars) `zip` (mkName <$> vars2))
+  let diff_dec = FunD 'diff [Clause [mkPat dcons vars, mkPat dcons vars2]
+                                 (NormalB $ foldl (AppE) (ConE dcons) df) []]
+  mkInstance (AppT (ConT ''ConfDiff) (ConT nd)) [diff_dec]
+
+-- | generates a default instance for the diff type derived from the default
+-- instance of the original type. example:
 -- instance Default TestConfDiff where
---   def = TestConfDiff (Just $ _foo def) (Just $ _bar def)
--- mkDiffDefaultInstance :: Name -> Name -> DecsQ
--- mkDiffDefaultInstance n nd = do
---   fs <- getFields n
---   isconf <- mapM (\t -> isInstance ''Conf [t]) $ map snd fs
---   constr <- mkName . (++"Diff") . nameBase <$> getConstr n
---   let def_dec = FunD 'def [Clause [] (NormalB $ foldl (AppE) (ConE constr)
---                  $ map (\((f,_),c) -> AppE (ConE 'Just) $ if c then VarE 'def
---                                  else (AppE (VarE f) $ VarE 'def)) $ zip fs isconf) []]
---   return [InstanceD Nothing [] (AppT (ConT ''Default) (ConT nd)) [def_dec] ]
+--   def = mkDiff (def :: TestConf)
+mkDiffDefaultInstance :: Name -> Name -> DecsQ
+mkDiffDefaultInstance n nd = do
+  let def_diff = FunD 'def [Clause [] (NormalB
+               $ (VarE 'mkDiff)`AppE`(SigE (VarE 'def) (ConT n))) []]
+  mkInstance (AppT (ConT ''Default) (ConT nd)) [def_diff]
 
+-- | Call this to generate all the necessary machinery, after providing
+-- a default instance for your type. IMPORTANT:
+-- If your configuration has nested configurations, you need to call makeConfig on
+-- them FIRST!
 makeConfig :: Name -> DecsQ
 makeConfig tname = do
   elig <- isEligible tname
-  if not elig then error $ (nameBase tname) ++ " is not a single-constructor primitive record type"
-                                            ++ " and can not be used as a configuration container!"
+  if not elig
+  then error $ (nameBase tname) ++ " is not a single-constructor primitive record type"
+                                ++ " and can not be used as a configuration container!"
   else do
     let dtname = diffName tname
     cinst <- mkDummyInstance ''Conf tname
     difftype <- mkDiffType tname
-    cdinst <- mkDummyInstance ''ConfDiff dtname
+    cdinst <- mkDiffInstance tname dtname
     monoinst <- mkMonoidInstance tname dtname
     rinst <- mkRelInstance tname dtname
-    return $ cinst ++ difftype ++ cdinst ++ monoinst ++ rinst
+    ddinst <- mkDiffDefaultInstance tname dtname
+    return $ cinst ++ difftype ++ cdinst ++ monoinst ++ rinst ++ ddinst
 
--- need to do this in seperate step or GHC complains
+-- | Generates JSON instance for the auto-generated ConfDiff types that is required for
+-- the YAML reading. This needs to be done in seperate step (otherwise GHC complains)
 deriveConfigJSON :: Name -> DecsQ
 deriveConfigJSON tname = do
   deriveJSON defaultOptions{fieldLabelModifier=tail . tail} $ diffName tname
